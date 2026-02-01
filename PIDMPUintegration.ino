@@ -1,215 +1,354 @@
-// ================= MOTOR PINS =================
-#define LIN1 2
-#define LIN2 4
-#define RIN1 6
-#define RIN2 7
-#define STBY 13
-#define PWMA 3
-#define PWMB 5
+#include <Wire.h>
 
-// ================= SENSOR PINS =================
-#define S0 14
-#define S1 15
-#define S2 18
-#define S3 17
-#define OUT A2
+#define MPU_ADDR    0x68
+#define PWR_MGMT_1  0x6B
+#define GYRO_CONFIG 0x1B
+#define GYRO_ZOUT_H 0x47
 
-#define NUM_SENSORS 16
+// === Ultrasonic pins ===
+int trigf = 10, echof = 11;
+int trigr = 12, echor = 13;
+int trigl = 14, echol = 15;  // A0/A1 as digital OK on Uno
 
-// ================= PARAMETERS =================
-float Kp = 0.12;
-float Kd = 0.06;
+// === Motor pins (L293D / TB6612 style) ===
+int in1 = 2;
+int in2 = 3;
+int in3 = 4;
+int in4 = 7;
+int PWMA = 5;   // PWM - left
+int PWMB = 6;   // PWM - right
+int stdby = 8; // for TB6612; on L293D you can ignore but keep HIGH
 
-int baseSpeed = 150;
-int maxTurn   = 200;
+const int baseSpeed   = 150; // fwd speed
+const int maxSpeed    = 150; // PID clamp
+const int turnPWM     = 38; // turning speed (both wheels opposite)
 
-// EARLIER TURN DETECTION
-#define LEFT_POS_TH   -3000
-#define RIGHT_POS_TH   3000
+float error = 0 ;
 
-#define TURN_COMMIT_TIME 130
+// === Button ===
+const int buttonPin = 9;
+unsigned long lastButtonPress = 0;
+bool motorsEnabled = false;
 
-// ================= GLOBALS =================
-int sensorRaw[NUM_SENSORS];
-int sensorMin[NUM_SENSORS];
-int sensorMax[NUM_SENSORS];
-int sensorNorm[NUM_SENSORS];
+// === PID gains (wall following) ===
+float Kp = 1.824, Ki = 0.001, Kd = 0.4;
+float integral = 0;
+float lastError = 0;
+const int integralLimit = 200; // no dt -> keep small
 
-long position = 0;
-long lastPosition = 0;
-long lastError = 0;
+// === Control loop timing (not strictly used now) ===
+unsigned long lastTime = 0;
 
-unsigned long turnStart = 0;
-bool turningLeft  = false;
-bool turningRight = false;
+// === Maze params ===
+const int sideOpenThresh = 24;  // cm to consider cell opening
+const int stopFront      = 8;  // cm hard stop to avoid collision
+const int corridorThresh = 17;
 
-// ================= SETUP =================
-void setup() {
-  pinMode(S0, OUTPUT); pinMode(S1, OUTPUT);
-  pinMode(S2, OUTPUT); pinMode(S3, OUTPUT);
-  pinMode(OUT, INPUT);
+const unsigned long PID_PERIOD_MS = 75;
 
-  pinMode(LIN1, OUTPUT); pinMode(LIN2, OUTPUT);
-  pinMode(RIN1, OUTPUT); pinMode(RIN2, OUTPUT);
-  pinMode(STBY, OUTPUT);
-  pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
+// Motor compensation
+const int   PWM_DEADBAND = 60;  // min PWM that actually moves your motors
+const float LEFT_SCALE   = 1.00; // tweak if one side is stronger (e.g., 0.95)
+const float RIGHT_SCALE  = 1.00;
 
-  digitalWrite(STBY, HIGH);
+// === Yaw integration ===
+float yawZero = 0.0f;           // not used but kept for future
+const float ANGLE_TOL = 3.0f;   // deg tolerance
+float gzBias = 0.0f;            // gyro bias (dps)
 
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    sensorMin[i] = 1023;
-    sensorMax[i] = 0;
-  }
-
-  calibrateSensors(600);
-  Serial.begin(9600);
+// -------------------- MPU helpers --------------------
+static inline int16_t readGyroZRaw() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(GYRO_ZOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 2, true);
+  int16_t gz_raw = (Wire.read() << 8) | Wire.read();
+  return gz_raw;
 }
 
-// ================= LOOP =================
-void loop() {
-
-  readSensors();
-  normalizeSensors();
-  computePosition();
-
-  unsigned long now = millis();
-
-  // ================= SHARP TURN COMMIT =================
-  if (turningLeft) {
-    Serial.println("Entered Left");
-    if((sensorNorm[8] > 890 &&
-      sensorNorm[9] > 890) ||
-      (sensorNorm[10] > 890 &&
-       sensorNorm[11] > 890)){
-        turningLeft = false;
-        return;
-       }
-    else{
-      driveMotors(-100, 100);
-    }
-     // delay(1200);
-    Serial.println("Exiting Left");
-  }
-
-  if (turningRight) {
-     Serial.println("Entered Right");
-    if((sensorNorm[8] > 890 &&
-      sensorNorm[9] > 890) ||
-      (sensorNorm[10] > 890 &&
-       sensorNorm[11] > 890)){
-        turningRight = false;
-        return;}
-   else{
-    driveMotors(100, -100);}
-    // delay(1200);
-    Serial.println("Exiting Right");
-    
-  }
-
-  // ================= TURN DETECTION =================
-  if (sensorNorm[3] > 890 &&
-      sensorNorm[4] > 890 &&
-      sensorNorm[5] > 890) {
-    turningLeft = true;
-    Serial.println("Entering Left");
-    driveMotors(70,70);
-    delay(150);
-    return;
-  }
-
-  if (sensorNorm[9] > 890 &&
-      sensorNorm[10] > 890 &&
-      sensorNorm[11] > 890) {
-    turningRight = true;
-    Serial.println("Entering Right");
-    return;
-  }
-  if (sensorNorm[])
-
-
-  // ================= LINE FOLLOW =================
-  long error = -position;
-
-  if (abs(error) < 200) error = 0;
-
-  long P = error * Kp;
-  long D = (error - lastError) * Kd;
-  lastError = error;
-
-  long turn = constrain(P + D, -maxTurn, maxTurn);
-
-  int leftPWM  = baseSpeed - turn;
-  int rightPWM = baseSpeed + turn;
-
-  leftPWM  = constrain(leftPWM,  0, 255);
-  rightPWM = constrain(rightPWM, 0, 255);
-
-  driveMotors(leftPWM, rightPWM);
-
-  Serial.println(position);
+float readGyroZ() {
+  // Sensitivity: 131 LSB/(°/s) at ±250 dps
+  return (readGyroZRaw() / 131.0f) - gzBias; // dps after bias
 }
 
-// ================= POSITION =================
-void computePosition() {
-  long sum = 0, weighted = 0;
+void initMPU() {
+  Wire.begin();
 
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    int w = (i * 1000) - 7500;
-    weighted += (long)sensorNorm[i] * w;
-    sum += sensorNorm[i];
-  }
+  // Wake up device
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(PWR_MGMT_1);
+  Wire.write(0x00);
+  Wire.endTransmission();
 
-  if (sum > 300) position = weighted / sum;
-  else position = lastPosition;
-
-  lastPosition = position;
+  // Gyro ±250 dps
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(GYRO_CONFIG);
+  Wire.write(0x00);
+  Wire.endTransmission();
 }
 
-// ================= SENSOR =================
-void readSensors() {
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    digitalWrite(S0, i & 1);
-    digitalWrite(S1, i & 2);
-    digitalWrite(S2, i & 4);
-    digitalWrite(S3, i & 8);
-    delayMicroseconds(5);
-    sensorRaw[i] = analogRead(OUT);
+void calibrateGyroZ(uint16_t samples = 500) {
+  delay(300); // let it settle
+  long sum = 0;
+  for (uint16_t i = 0; i < samples; i++) {
+    sum += readGyroZRaw();
+    delay(2);
   }
+  float avgRaw = sum / (float)samples;
+  gzBias = avgRaw / 131.0f; // dps
 }
 
-void normalizeSensors() {
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    int v = constrain(sensorRaw[i], sensorMin[i], sensorMax[i]);
-    sensorNorm[i] = (long)(v - sensorMin[i]) * 1000 /
-                    (sensorMax[i] - sensorMin[i] + 1);
-  }
+// -------------------- Ultrasound --------------------
+float getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 20000);  // 20ms timeout
+  if (duration == 0) return 1000;              // no echo → far away
+  return duration * 0.034 / 2;                 // cm
 }
 
-// ================= MOTORS =================
-void driveMotors(int l, int r) {
+// -------------------- Motion primitives --------------------
+void stop() {
+
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+  delay(1000);
+}
+
+void setFwdDir() {
+  // optional: you can omit this entirely and just call driveMotors in PID
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+}
+
+
+void setInPlaceRight() {
+  // left fwd, right back -> sharper, symmetric turn
+  digitalWrite(in1, HIGH);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, HIGH);
+}
+
+void setInPlaceLeft() {
+  // left back, right fwd
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH);
+  digitalWrite(in4, LOW);
+}
+
+void driveMotors(int left, int right) {
+  // scale for asymmetry
+  float lf = left  * LEFT_SCALE;
+  float rf = right * RIGHT_SCALE;
+
+  // deadband (both directions)
+  if (lf > 0 && lf < PWM_DEADBAND) lf = PWM_DEADBAND;
+  if (lf < 0 && lf > -PWM_DEADBAND) lf = -PWM_DEADBAND;
+  if (rf > 0 && rf < PWM_DEADBAND) rf = PWM_DEADBAND;
+  if (rf < 0 && rf > -PWM_DEADBAND) rf = -PWM_DEADBAND;
+
   // clamp
-  l = constrain((int)l, -200, 200);
-  r = constrain((int)r, -200, 200);
+  lf = constrain((int)lf, -255, 255);
+  rf = constrain((int)rf, -255, 255);
 
   // set direction pins once per side
-  if (l >= 0) { digitalWrite(LIN1, HIGH); digitalWrite(LIN2, LOW);  }
-  else         { digitalWrite(LIN1, LOW);  digitalWrite(LIN2, HIGH); }
+  if (lf >= 0) { digitalWrite(in1, HIGH); digitalWrite(in2, LOW);  }
+  else         { digitalWrite(in1, LOW);  digitalWrite(in2, HIGH); }
 
-  if (r >= 0) { digitalWrite(RIN1, HIGH); digitalWrite(RIN2, LOW);  }
-  else         { digitalWrite(RIN1, LOW);  digitalWrite(RIN2, HIGH); }
+  if (rf >= 0) { digitalWrite(in3, HIGH); digitalWrite(in4, LOW);  }
+  else         { digitalWrite(in3, LOW);  digitalWrite(in4, HIGH); }
 
-  analogWrite(PWMA, abs((int)l));
-  analogWrite(PWMB, abs((int)r));
+  analogWrite(PWMA, abs((int)lf));
+  analogWrite(PWMB, abs((int)rf));
 }
 
-// ================= CALIBRATION =================
-void calibrateSensors(int loops) {
-  for (int j = 0; j < loops; j++) {
-    readSensors();
-    for (int i = 0; i < NUM_SENSORS; i++) {
-      sensorMin[i] = min(sensorMin[i], sensorRaw[i]);
-      sensorMax[i] = max(sensorMax[i], sensorRaw[i]);
-    }
-    delay(5);
+
+// -------------------- PID (wall following) --------------------
+unsigned long lastPID = 0;
+float integ = 0, lastErr = 0;
+
+void PID_step() {
+  // read in an order that reduces echo overlap
+  float leftDist  = getDistance(trigl, echol);
+  delay(3);
+  float rightDist = getDistance(trigr, echor);
+  delay(3);
+  float frontDist = getDistance(trigf, echof);
+  delay(3);
+  
+  // error: center between walls
+  float err = 0;
+  static float lastLeft = corridorThresh/2;
+  static float lastRight = corridorThresh/2;
+
+// when both visible
+  if (leftDist < corridorThresh && rightDist < corridorThresh) {
+      err = rightDist - leftDist;
+      lastLeft  = leftDist;
+      lastRight = rightDist;
   }
+  else if (leftDist > corridorThresh && rightDist < corridorThresh) {
+      // left wall gone → pretend it’s still at lastLeft
+      err = rightDist - lastLeft;
+      lastRight = rightDist;
+  }
+  else if (leftDist < corridorThresh && rightDist > corridorThresh) {
+      // right wall gone → pretend it’s still at lastRight
+      err = lastRight - leftDist;
+      lastLeft = leftDist;
+  }
+  else {
+      // both gone → straight
+      err = 0;
+  }
+
+  // timing
+  unsigned long now = millis();
+  float dt = (lastPID == 0) ? (PID_PERIOD_MS/1000.0f) : (now - lastPID)/1000.0f;
+  lastPID = now;
+  if (dt <= 0) dt = PID_PERIOD_MS/1000.0f;
+
+  // PID (with anti-windup)
+  integ += err * dt;
+  integ = constrain(integ, -100.0f, 100.0f);
+  float deriv = (err - lastErr) / dt;
+  float corr  = Kp*err + Ki*integ + Kd*deriv;
+  lastErr = err;
+
+  int leftSpeed  = baseSpeed + (int)corr;
+  int rightSpeed = baseSpeed - (int)corr;
+
+  driveMotors(leftSpeed, rightSpeed);
+
+  Serial.print("err:"); Serial.print(error); 
+  Serial.print(" corr:"); Serial.print(corr); 
+  Serial.print(" LPWM:"); Serial.print(leftSpeed); 
+  Serial.print(" RPWM:"); Serial.print(rightSpeed); 
+  Serial.print(" F:"); Serial.print(frontDist);
+  Serial.print(" L:"); Serial.print(leftDist);
+  Serial.print(" R:"); Serial.println(rightDist);
 }
+
+
+// -------------------- Gyro-accurate turn --------------------
+void turnByAngle(float targetAngleDeg) {
+  // positive = right turn, negative = left turn
+  unsigned long last = millis();
+  float yaw = 0;
+
+  // set direction based on sign & set turn speed
+  if (targetAngleDeg < 0) setInPlaceRight();
+  else                    setInPlaceLeft();
+  analogWrite(PWMA, turnPWM);
+  analogWrite(PWMB, turnPWM);
+
+  const unsigned long failSafeMs = 4000; // 4s guard for 180°
+  unsigned long start = millis();
+
+  while (true) {
+    unsigned long now = millis();
+    float dt = (now - last) / 1000.0f;
+    last = now;
+
+    float gz_dps = readGyroZ();
+    yaw += gz_dps * dt; // integrate
+
+    float remaining = targetAngleDeg - yaw;
+    if (fabs(remaining) <= ANGLE_TOL) break;
+
+    if (now - start > failSafeMs) break; // safety exit
+
+    Serial.print("Yaw: ");
+    Serial.println(yaw);
+  }
+
+  stop(); // full stop at the end of the turn
+
+  Serial.print("Turn complete: ");
+  Serial.println(yaw);
+}
+// -------------------- Button toggle --------------------
+void toggleMotors() {
+  static bool lastState = HIGH;
+  bool currentState = digitalRead(buttonPin);
+  if (lastState == HIGH && currentState == LOW) {
+    if (millis() - lastButtonPress > 250) { // debounce
+      motorsEnabled = !motorsEnabled;
+      digitalWrite(stdby, motorsEnabled ? HIGH : LOW);
+      lastButtonPress = millis();
+    }
+  }
+  lastState = currentState;
+}
+
+// -------------------- Arduino setup/loop --------------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(trigf, OUTPUT);
+  pinMode(trigl, OUTPUT);
+  pinMode(trigr, OUTPUT);
+  pinMode(echof, INPUT);
+  pinMode(echol, INPUT);
+  pinMode(echor, INPUT);
+
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT);
+  pinMode(in4, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  pinMode(stdby, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  digitalWrite(stdby, HIGH);
+  analogWrite(PWMA, baseSpeed);
+  analogWrite(PWMB, baseSpeed);
+
+  Wire.begin();
+  initMPU();
+  calibrateGyroZ(600); // IMPORTANT: keep bot still during boot
+  Serial.println("MPU initialized & gyro calibrated.");
+}
+
+void loop() {
+  toggleMotors();
+  if (!motorsEnabled) { driveMotors(0,0); return; }
+
+  // Read openings once to avoid duplicate sonar hits
+  float left  = getDistance(trigl, echol);
+  float right = getDistance(trigr, echor);
+  float front = getDistance(trigf, echof);
+
+  // Safety: if front is blocked, turn (left-priority)
+  if (front < stopFront) {
+    stop();
+    if (left > sideOpenThresh)      
+    { turnByAngle(90.0f);
+      setFwdDir();
+      // delay(2000);
+    }
+    else if (right > sideOpenThresh){ 
+      turnByAngle(-90.0f);
+      setFwdDir();
+      // delay(2000);
+        }
+    else{ 
+      turnByAngle(180.0f);
+      setFwdDir();
+      // delay(2000);
+        }
+  }
+
+  else{
+    PID_step();
+    // delay(PID_PERIOD_MS);
+  }
