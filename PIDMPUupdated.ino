@@ -19,7 +19,7 @@ int PWMA = 5;   // PWM - left
 int PWMB = 6;   // PWM - right
 int stdby = 8; // for TB6612; on L293D you can ignore but keep HIGH
 
-const int baseSpeed   = 60; // fwd speed
+const int baseSpeed   = 50; // fwd speed
 const int maxSpeed    = 150; // PID clamp
 const int turnPWM     = 28; // turning speed (both wheels opposite)
 
@@ -99,6 +99,15 @@ void calibrateGyroZ(uint16_t samples = 500) {
 }
 
 // -------------------- Ultrasound --------------------
+// float getDistanceF(int trig, int echo) {
+//   digitalWrite(trig, LOW);  delayMicroseconds(2);
+//   digitalWrite(trig, HIGH); delayMicroseconds(10);
+//   digitalWrite(trig, LOW);
+//   long duration = pulseIn(echo, HIGH, 20000);  // 20ms timeout
+//   if (duration == 0) return 1000;              // no echo → far away
+//   return duration * 0.034 / 2;                 // cm
+// }
+
 float getDistance(int trig, int echo) {
   digitalWrite(trig, LOW);  delayMicroseconds(2);
   digitalWrite(trig, HIGH); delayMicroseconds(10);
@@ -117,7 +126,7 @@ void stop() {
   digitalWrite(in4, LOW);
   analogWrite(PWMA, 0);
   analogWrite(PWMB, 0);
-  delay(1000);
+  delay(500);
 }
 
 void setFwdDir() {
@@ -174,14 +183,14 @@ void driveMotors(int left, int right) {
 unsigned long lastPID = 0;
 float integ = 0, lastErr = 0;
 
-void PID_step() {
+void PID_step(int left, int right) {
   // read in an order that reduces echo overlap
-  float leftDist  = getDistance(trigl, echol);
-  delay(3);
-  float rightDist = getDistance(trigr, echor);
-  delay(3);
-  float frontDist = getDistance(trigf, echof);
-  delay(3);
+  // float left  = getDistance(trigl, echol);
+  // delay(3);
+  // float right = getDistance(trigr, echor);
+  // delay(3);
+  // float front = getDistance(trigf, echof);
+  // delay(3);
   
   // error: center between walls
   float err = 0;
@@ -189,20 +198,20 @@ void PID_step() {
   static float lastRight = corridorThresh/2;
 
 // when both visible
-  if (leftDist < corridorThresh && rightDist < corridorThresh) {
-      err = rightDist - leftDist;
-      lastLeft  = leftDist;
-      lastRight = rightDist;
+  if (left < corridorThresh && right < corridorThresh) {
+      err = right - left;
+      lastLeft  = left;
+      lastRight = right;
   }
-  else if (leftDist > corridorThresh && rightDist < corridorThresh) {
+  else if (left > corridorThresh && right < corridorThresh) {
       // left wall gone → pretend it’s still at lastLeft
-      err = rightDist - lastLeft;
-      lastRight = rightDist;
+      err = right - lastLeft;
+      lastRight = right;
   }
-  else if (leftDist < corridorThresh && rightDist > corridorThresh) {
+  else if (left < corridorThresh && right > corridorThresh) {
       // right wall gone → pretend it’s still at lastRight
-      err = lastRight - leftDist;
-      lastLeft = leftDist;
+      err = lastRight - left;
+      lastLeft = left;
   }
   else {
       // both gone → straight
@@ -231,9 +240,9 @@ void PID_step() {
   Serial.print(" corr:"); Serial.print(corr); 
   Serial.print(" LPWM:"); Serial.print(leftSpeed); 
   Serial.print(" RPWM:"); Serial.print(rightSpeed); 
-  Serial.print(" F:"); Serial.print(frontDist);
-  Serial.print(" L:"); Serial.print(leftDist);
-  Serial.print(" R:"); Serial.println(rightDist);
+  // Serial.print(" F:"); Serial.print(front);
+  Serial.print(" L:"); Serial.print(left);
+  Serial.print(" R:"); Serial.println(right);
 }
 
 
@@ -290,7 +299,7 @@ void toggleMotors() {
 
 // -------------------- Arduino setup/loop --------------------
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
 
   pinMode(trigf, OUTPUT);
   pinMode(trigl, OUTPUT);
@@ -325,8 +334,11 @@ void loop() {
 
   // Read openings once to avoid duplicate sonar hits
   float left  = getDistance(trigl, echol);
+  delay(3);
   float right = getDistance(trigr, echor);
+  delay(3);
   float front = getDistance(trigf, echof);
+  delay(3);
 
   // Safety: if front is blocked, turn (left-priority)
   if (front < stopFront) {
@@ -349,7 +361,7 @@ void loop() {
   }
 
   else{
-    PID_step();
+    PID_step(left,right);
     // delay(PID_PERIOD_MS);
   }
 }
