@@ -1,0 +1,93 @@
+#define LEFT_A   A2
+#define LEFT_B   A3
+#define RIGHT_A  A0
+#define RIGHT_B  A1
+
+volatile long leftCount = 0;
+volatile long rightCount = 0;
+
+uint8_t lastPortC;
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(LEFT_A, INPUT_PULLUP);
+  pinMode(LEFT_B, INPUT_PULLUP);
+  pinMode(RIGHT_A, INPUT_PULLUP);
+  pinMode(RIGHT_B, INPUT_PULLUP);
+
+  // Enable PCINT for A0–A5
+  PCICR |= (1 << PCIE1);
+
+  PCMSK1 |= (1 << PCINT10);   // A0
+  PCMSK1 |= (1 << PCINT11);   // A1
+  PCMSK1 |= (1 << PCINT8);  // A2
+  PCMSK1 |= (1 << PCINT9);  // A3
+
+  lastPortC = PINC;
+}
+
+ISR(PCINT1_vect) {
+
+  uint8_t currentPortC = PINC;
+
+  uint8_t changed = currentPortC ^ lastPortC;
+
+  // LEFT MOTOR — detect rising edge on A only
+  if (changed & (1 << PC0)) {
+
+    bool A = currentPortC & (1 << PC0);
+
+    if (A) {  // rising edge only
+
+      bool B = currentPortC & (1 << PC1);
+
+      if (B)
+        leftCount--;
+      else
+        leftCount++;
+    }
+  }
+
+  
+  if (changed & (1 << PC2)) {
+
+    bool A = currentPortC & (1 << PC2);
+
+    if (A) {  // rising edge only
+
+      bool B = currentPortC & (1 << PC3);
+
+      if (B)
+        rightCount--;
+      else
+        rightCount++;
+    }
+  }
+
+  lastPortC = currentPortC;
+}
+
+void loop() {
+
+  static long lastLeft = 0;
+  static long lastRight = 0;
+
+  noInterrupts();
+  long L = leftCount;
+  long R = rightCount;
+  interrupts();
+
+  if (L != lastLeft || R != lastRight) {
+
+    Serial.print("Left: ");
+    Serial.print(L);
+
+    Serial.print("  Right: ");
+    Serial.println(R);
+
+    lastLeft = L;
+    lastRight = R;
+  }
+}
