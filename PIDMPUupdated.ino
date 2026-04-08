@@ -1,37 +1,36 @@
-#include <Wire.h>
+;#include <Wire.h>
 
-#define MPU_ADDR    0x68
+#define MPU_ADDR    0x69
 #define PWR_MGMT_1  0x6B
 #define GYRO_CONFIG 0x1B
 #define GYRO_ZOUT_H 0x47
 
 // === Ultrasonic pins ===
-int trigf = 12 , echof =13;
-int trigr = 14, echor = 15;
-int trigl = 10, echol = 11;  // A0/A1 as digital OK on Uno
+int trigf = 12, echof = 11;
+int trigr = 9, echor = 8;
+int trigl = 13, echol = 10;  // A0/A1 as digital OK on Uno
 
 // === Motor pins (L293D / TB6612 style) ===
-int in1 = 2;
-int in2 = 3;
-int in3 = 7;
-int in4 = 4;
-int PWMA = 5;   // PWM - left
-int PWMB = 6;   // PWM - right
-int stdby = 8; // for TB6612; on L293D you can ignore but keep HIGH
+int in1 = 5;
+int in2 = 7;
+int in3 = 4;
+int in4 = 2;
+int PWMA = 6;   // PWM - left
+int PWMB = 3;   // PWM - right; // for TB6612; on L293D you can ignore but keep HIGH
 
-const int baseSpeed   = 50; // fwd speed
+const int baseSpeed   = 70; // fwd speed
 const int maxSpeed    = 150; // PID clamp
-const int turnPWM     = 28; // turning speed (both wheels opposite)
+const int turnPWM     = 38; // turning speed (both wheels opposite)
 
 float error = 0 ;
 
 // === Button ===
-const int buttonPin = 9;
-unsigned long lastButtonPress = 0;
-bool motorsEnabled = false;
+// const int buttonPin = 9;
+// unsigned long lastButtonPress = 0;
+// bool motorsEnabled = false;
 
 // === PID gains (wall following) ===
-float Kp = 1.35, Ki = 0.001, Kd = 0.922;
+float Kp = 1.824, Ki = 0.001, Kd = 0.44;
 float integral = 0;
 float lastError = 0;
 const int integralLimit = 200; // no dt -> keep small
@@ -40,9 +39,9 @@ const int integralLimit = 200; // no dt -> keep small
 unsigned long lastTime = 0;
 
 // === Maze params ===
-const int sideOpenThresh = 24;  // cm to consider cell opening
-const int stopFront      = 8;  // cm hard stop to avoid collision
-const int corridorThresh = 17;
+const int sideOpenThresh = 6;  // cm to consider cell opening
+const int stopFront      = 5;  // cm hard stop to avoid collision
+const int corridorThresh = 10;
 
 const unsigned long PID_PERIOD_MS = 75;
 
@@ -99,15 +98,6 @@ void calibrateGyroZ(uint16_t samples = 500) {
 }
 
 // -------------------- Ultrasound --------------------
-// float getDistanceF(int trig, int echo) {
-//   digitalWrite(trig, LOW);  delayMicroseconds(2);
-//   digitalWrite(trig, HIGH); delayMicroseconds(10);
-//   digitalWrite(trig, LOW);
-//   long duration = pulseIn(echo, HIGH, 20000);  // 20ms timeout
-//   if (duration == 0) return 1000;              // no echo → far away
-//   return duration * 0.034 / 2;                 // cm
-// }
-
 float getDistance(int trig, int echo) {
   digitalWrite(trig, LOW);  delayMicroseconds(2);
   digitalWrite(trig, HIGH); delayMicroseconds(10);
@@ -126,7 +116,7 @@ void stop() {
   digitalWrite(in4, LOW);
   analogWrite(PWMA, 0);
   analogWrite(PWMB, 0);
-  delay(500);
+  delay(1000);
 }
 
 void setFwdDir() {
@@ -183,14 +173,14 @@ void driveMotors(int left, int right) {
 unsigned long lastPID = 0;
 float integ = 0, lastErr = 0;
 
-void PID_step(int left, int right) {
+void PID_step() {
   // read in an order that reduces echo overlap
-  // float left  = getDistance(trigl, echol);
-  // delay(3);
-  // float right = getDistance(trigr, echor);
-  // delay(3);
-  // float front = getDistance(trigf, echof);
-  // delay(3);
+  float leftDist  = getDistance(trigl, echol);
+  delay(3);
+  float rightDist = getDistance(trigr, echor);
+  delay(3);
+  float frontDist = getDistance(trigf, echof);
+  delay(3);
   
   // error: center between walls
   float err = 0;
@@ -198,20 +188,20 @@ void PID_step(int left, int right) {
   static float lastRight = corridorThresh/2;
 
 // when both visible
-  if (left < corridorThresh && right < corridorThresh) {
-      err = right - left;
-      lastLeft  = left;
-      lastRight = right;
+  if (leftDist < corridorThresh && rightDist < corridorThresh) {
+      err = rightDist - leftDist;
+      lastLeft  = leftDist;
+      lastRight = rightDist;
   }
-  else if (left > corridorThresh && right < corridorThresh) {
+  else if (leftDist > corridorThresh && rightDist < corridorThresh) {
       // left wall gone → pretend it’s still at lastLeft
-      err = right - lastLeft;
-      lastRight = right;
+      err = rightDist - lastLeft;
+      lastRight = rightDist;
   }
-  else if (left < corridorThresh && right > corridorThresh) {
+  else if (leftDist < corridorThresh && rightDist > corridorThresh) {
       // right wall gone → pretend it’s still at lastRight
-      err = lastRight - left;
-      lastLeft = left;
+      err = lastRight - leftDist;
+      lastLeft = leftDist;
   }
   else {
       // both gone → straight
@@ -231,8 +221,8 @@ void PID_step(int left, int right) {
   float corr  = Kp*err + Ki*integ + Kd*deriv;
   lastErr = err;
 
-  int leftSpeed  = baseSpeed + (int)corr;
-  int rightSpeed = baseSpeed - (int)corr;
+  int leftSpeed  = baseSpeed - (int)corr;
+  int rightSpeed = baseSpeed + (int)corr;
 
   driveMotors(leftSpeed, rightSpeed);
 
@@ -240,9 +230,9 @@ void PID_step(int left, int right) {
   Serial.print(" corr:"); Serial.print(corr); 
   Serial.print(" LPWM:"); Serial.print(leftSpeed); 
   Serial.print(" RPWM:"); Serial.print(rightSpeed); 
-  // Serial.print(" F:"); Serial.print(front);
-  Serial.print(" L:"); Serial.print(left);
-  Serial.print(" R:"); Serial.println(right);
+  Serial.print(" F:"); Serial.print(frontDist);
+  Serial.print(" L:"); Serial.print(leftDist);
+  Serial.print(" R:"); Serial.println(rightDist);
 }
 
 
@@ -253,8 +243,8 @@ void turnByAngle(float targetAngleDeg) {
   float yaw = 0;
 
   // set direction based on sign & set turn speed
-  if (targetAngleDeg < 0) setInPlaceLeft();
-  else                    setInPlaceRight();
+  if (targetAngleDeg < 0) setInPlaceRight();
+  else                    setInPlaceLeft();
   analogWrite(PWMA, turnPWM);
   analogWrite(PWMB, turnPWM);
 
@@ -284,22 +274,22 @@ void turnByAngle(float targetAngleDeg) {
   Serial.println(yaw);
 }
 // -------------------- Button toggle --------------------
-void toggleMotors() {
-  static bool lastState = HIGH;
-  bool currentState = digitalRead(buttonPin);
-  if (lastState == HIGH && currentState == LOW) {
-    if (millis() - lastButtonPress > 250) { // debounce
-      motorsEnabled = !motorsEnabled;
-      digitalWrite(stdby, motorsEnabled ? HIGH : LOW);
-      lastButtonPress = millis();
-    }
-  }
-  lastState = currentState;
-}
+// void toggleMotors() {
+//   static bool lastState = HIGH;
+//   bool currentState = digitalRead(buttonPin);
+//   if (lastState == HIGH && currentState == LOW) {
+//     if (millis() - lastButtonPress > 250) { // debounce
+//       motorsEnabled = !motorsEnabled;
+//       digitalWrite(stdby, motorsEnabled ? HIGH : LOW);
+//       lastButtonPress = millis();
+//     }
+//   }
+//   lastState = currentState;
+// }
 
 // -------------------- Arduino setup/loop --------------------
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   pinMode(trigf, OUTPUT);
   pinMode(trigl, OUTPUT);
@@ -315,10 +305,10 @@ void setup() {
   pinMode(PWMA, OUTPUT);
   pinMode(PWMB, OUTPUT);
 
-  pinMode(stdby, OUTPUT);
-  pinMode(buttonPin, INPUT_PULLUP);
+  // pinMode(stdby, OUTPUT);
+//  pinMode(buttonPin, INPUT_PULLUP);
 
-  digitalWrite(stdby, HIGH);
+  //digitalWrite(stdby, HIGH);
   analogWrite(PWMA, baseSpeed);
   analogWrite(PWMB, baseSpeed);
 
@@ -334,34 +324,32 @@ void loop() {
 
   // Read openings once to avoid duplicate sonar hits
   float left  = getDistance(trigl, echol);
-  delay(3);
   float right = getDistance(trigr, echor);
-  delay(3);
   float front = getDistance(trigf, echof);
-  delay(3);
 
   // Safety: if front is blocked, turn (left-priority)
   if (front < stopFront) {
     stop();
-    if (left > sideOpenThresh)      
-    { turnByAngle(-90.0f);
+    if (right > sideOpenThresh)      
+    { turnByAngle(90.0f);
       setFwdDir();
       // delay(2000);
     }
-    else if (right > sideOpenThresh){ 
-      turnByAngle(90.0f);
+    else if (left > sideOpenThresh){ 
+      turnByAngle(-90.0f);
       setFwdDir();
       // delay(2000);
         }
     else{ 
-      turnByAngle(-180.0f);
+      turnByAngle(180.0f);
       setFwdDir();
       // delay(2000);
         }
   }
 
   else{
-    PID_step(left,right);
+    PID_step();
     // delay(PID_PERIOD_MS);
   }
+
 }
