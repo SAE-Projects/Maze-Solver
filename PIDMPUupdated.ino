@@ -1,4 +1,4 @@
-;#include <Wire.h>
+#include <Wire.h>
 
 #define MPU_ADDR    0x69
 #define PWR_MGMT_1  0x6B
