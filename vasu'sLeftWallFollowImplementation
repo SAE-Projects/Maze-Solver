@@ -1,0 +1,418 @@
+#include <Wire.h>
+
+#define MPU_ADDR    0x69
+#define PWR_MGMT_1  0x6B
+#define GYRO_CONFIG 0x1B
+#define GYRO_ZOUT_H 0x47
+
+float leftDist = 10.0, rightDist = 10.0, frontDist = 10.0; // Last known distances
+unsigned long lastPingTime = 0;
+int sensorTurn = 0; // 0=Left, 1=Right, 2=Front
+
+const int PING_INTERVAL = 20; // Wait 15ms between pings so echoes die out
+
+// === Ultrasonic pins ===
+int trigf = 12, echof = 11;
+int trigr = 9,  echor = 8;
+int trigl = 13, echol = 10;
+
+// === Motor pins ===
+int in1 = 5;
+int in2 = 7;
+int in3 = 4;
+int in4 = 2;
+int PWMA = 6;   // PWM - left
+int PWMB = 3;   // PWM - right
+
+// === Encoder Pins ===
+#define LEFT_A   A0
+#define LEFT_B   A1
+#define RIGHT_A  A2
+#define RIGHT_B  A3
+
+// === Speeds & Limits ===
+const int baseSpeed   = 120; 
+const int maxSpeed    = 150; 
+const int turnPWM     = 38;  
+const int PWM_DEADBAND = 30; 
+
+const float LEFT_SCALE  = 1.00; 
+const float RIGHT_SCALE = 1.00;
+
+// === Maze & Movement params ===
+const int sideOpenThresh = 18;  // cm to consider cell opening
+const int stopFront      = 8;   // cm hard stop to avoid collision
+const int corridorThresh = 12;
+const long TICKS_HALF_CELL = 150; // For 20cm cells, 44mm wheels, 300PPR
+
+// === PID & Fusion Gains ===
+float Kp = 1.824, Ki = 0.001, Kd = 0.44;
+float K_wall = 1.0; 
+float K_yaw  = 0.9; // Tune: higher means it prioritizes staying straight over centering
+
+float integ = 0;
+float lastErr = 0;
+unsigned long lastPID = 0;
+const int integralLimit = 200; 
+
+// === State Variables ===
+volatile long leftCount = 0;
+volatile long rightCount = 0;
+uint8_t lastPortC;
+
+float currentYaw = 0.0;
+unsigned long lastYawTime = 0;
+float gzBias = 0.0f;
+const float ANGLE_TOL = 3.0f; 
+
+// -------------------- PCINT Encoder ISR --------------------
+ISR(PCINT1_vect) {
+  uint8_t currentPortC = PINC;
+  uint8_t changed = currentPortC ^ lastPortC;
+
+  // LEFT MOTOR
+  if (changed & (1 << PC0)) {
+    bool A = currentPortC & (1 << PC0);
+    if (A) {  
+      bool B = currentPortC & (1 << PC1);
+      if (B) leftCount--;
+      else   leftCount++;
+    }
+  }
+  
+  // RIGHT MOTOR
+  if (changed & (1 << PC2)) {
+    bool A = currentPortC & (1 << PC2);
+    if (A) {  
+      bool B = currentPortC & (1 << PC3);
+      if (B) rightCount++;
+      else   rightCount--;
+    }
+  }
+  lastPortC = currentPortC;
+}
+
+// -------------------- MPU & Gyro --------------------
+static inline int16_t readGyroZRaw() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(GYRO_ZOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 2, true);
+  int16_t gz_raw = (Wire.read() << 8) | Wire.read();
+  return gz_raw;
+}
+
+float readGyroZ() {
+  return (readGyroZRaw() / 131.0f) - gzBias;
+}
+
+void initMPU() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(PWR_MGMT_1);
+  Wire.write(0x00);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(GYRO_CONFIG);
+  Wire.write(0x00);
+  Wire.endTransmission();
+}
+
+void calibrateGyroZ(uint16_t samples = 500) {
+  delay(300);
+  long sum = 0;
+  for (uint16_t i = 0; i < samples; i++) {
+    sum += readGyroZRaw();
+    delay(2);
+  }
+  gzBias = (sum / (float)samples) / 131.0f; 
+}
+
+void updateYaw() {
+  unsigned long now = millis();
+  float dt = (now - lastYawTime) / 1000.0f;
+  lastYawTime = now;
+  if (dt > 0 && dt < 0.1) { 
+      currentYaw += readGyroZ() * dt;
+  }
+}
+
+// -------------------- Ultrasound --------------------
+float getDistanceSafe(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  
+  // 5000us timeout prevents freezing, but guarantees we wait for the echo
+  long duration = pulseIn(echo, HIGH, 5000); 
+  if (duration == 0) return 1000; 
+  return duration * 0.034 / 2; 
+}
+
+// void updateSensors() {
+//   unsigned long now = millis();
+  
+//   // If 15ms haven't passed yet, skip reading and let the bot keep driving!
+//   if (now - lastPingTime < PING_INTERVAL) {
+//     return; 
+//   }
+
+//   // It's time to read ONE sensor
+//   if (sensorTurn == 0) {
+//     leftDist = getDistance(trigl, echol);
+//     sensorTurn = 1; // Next time, read right
+//   } 
+//   else if (sensorTurn == 1) {
+//     rightDist = getDistance(trigr, echor);
+//     sensorTurn = 2; // Next time, read front
+//   } 
+//   else if (sensorTurn == 2) {
+//     frontDist = getDistance(trigf, echof);
+//     sensorTurn = 0; // Next time, back to left
+//   }
+
+//   lastPingTime = now; // Reset the timer
+// }
+
+// -------------------- Motion Primitives --------------------
+void stopMotors() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+  analogWrite(PWMA, 0);   analogWrite(PWMB, 0);
+}
+
+void setInPlaceRight() {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+}
+
+void setInPlaceLeft() {
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+}
+
+void driveMotors(int left, int right) {
+  float lf = left  * LEFT_SCALE;
+  float rf = right * RIGHT_SCALE;
+
+  if (lf > 0 && lf < PWM_DEADBAND) lf = PWM_DEADBAND;
+  if (lf < 0 && lf > -PWM_DEADBAND) lf = -PWM_DEADBAND;
+  if (rf > 0 && rf < PWM_DEADBAND) rf = PWM_DEADBAND;
+  if (rf < 0 && rf > -PWM_DEADBAND) rf = -PWM_DEADBAND;
+
+  lf = constrain((int)lf, -255, 255);
+  rf = constrain((int)rf, -255, 255);
+
+  if (lf >= 0) { digitalWrite(in1, HIGH); digitalWrite(in2, LOW);  }
+  else         { digitalWrite(in1, LOW);  digitalWrite(in2, HIGH); }
+
+  if (rf >= 0) { digitalWrite(in3, HIGH); digitalWrite(in4, LOW);  }
+  else         { digitalWrite(in3, LOW);  digitalWrite(in4, HIGH); }
+
+  analogWrite(PWMA, abs((int)lf));
+  analogWrite(PWMB, abs((int)rf));
+}
+
+// -------------------- Precise Control Functions --------------------
+void resetPID() {
+  integ = 0;
+  lastErr = 0;
+  currentYaw = 0; 
+  lastYawTime = millis();
+  lastPID = millis();
+}
+
+void driveTicksStraight(long targetTicks) {
+  noInterrupts();
+  leftCount = 0;
+  rightCount = 0;
+  interrupts();
+  
+  currentYaw = 0; 
+  lastYawTime = millis();
+  
+  while (true) {
+    noInterrupts();
+    long currentL = abs(leftCount); 
+    long currentR = abs(rightCount);
+    interrupts();
+
+    if ((currentL + currentR) / 2 >= targetTicks) break;
+
+    updateYaw();
+    float correction = currentYaw * 2.0; 
+    driveMotors(baseSpeed + (int)correction, baseSpeed - (int)correction);
+  }
+  stopMotors(); 
+}
+
+void turnByAngle(float targetAngleDeg) {
+  currentYaw = 0;
+  lastYawTime = millis();
+
+  // -90 is Left, +90 is Right
+  if (targetAngleDeg < 0) {
+    setInPlaceLeft();
+  } else {
+    setInPlaceRight();
+  }
+  
+  analogWrite(PWMA, turnPWM);
+  analogWrite(PWMB, turnPWM);
+
+  float targetAbs = fabs(targetAngleDeg);
+
+  while (true) {
+    updateYaw();
+    
+    // By using absolute value, we don't care if the gyro reads -90 or +90.
+    // We just care that it has traveled 90 degrees total!
+    float yawTraveled = fabs(currentYaw);
+    
+    if (yawTraveled >= targetAbs - ANGLE_TOL) {
+      break;
+    }
+  }
+  stopMotors();
+}
+void driveUntilWallsDetected() {
+  currentYaw = 0; 
+  lastYawTime = millis();
+  
+  while (true) {
+    // Keep polling the sensors in the background without delays
+    // updateSensors(); 
+    
+    // Break if both walls return, or if front wall approaches
+    // Notice we use the globals now!
+    if ((leftDist < corridorThresh && rightDist < corridorThresh) || frontDist < stopFront) {
+      break;
+    }
+
+    updateYaw();
+    float correction = currentYaw * 2.0; 
+    driveMotors(baseSpeed + (int)correction, baseSpeed - (int)correction);
+  }
+  resetPID(); 
+}
+
+// -------------------- Standard PID --------------------
+void PID_step() {
+  // NO delays or getDistance calls here anymore!
+  // We just trust the leftDist and rightDist globals.
+  
+  updateYaw(); 
+  
+  float err = 0;
+  float idealDist = corridorThresh / 2.0; 
+  
+  if (leftDist < corridorThresh && rightDist < corridorThresh) {
+      err = rightDist - leftDist;
+  } 
+  else if (leftDist < corridorThresh) {
+      float wallErr = idealDist - leftDist;
+      err = (wallErr * K_wall) - (currentYaw * K_yaw);
+  } 
+  else if (rightDist < corridorThresh) {
+      float wallErr = rightDist - idealDist;
+      err = (wallErr * K_wall) - (currentYaw * K_yaw);
+  } 
+  else {
+      err = -currentYaw * K_yaw;
+  }
+
+  unsigned long now = millis();
+  float dt = (now - lastPID) / 1000.0f;
+  lastPID = now;
+  if (dt <= 0) dt = 0.05;
+
+  integ += err * dt;
+  integ = constrain(integ, -100.0f, 100.0f);
+  float deriv = (err - lastErr) / dt;
+  float corr  = Kp*err + Ki*integ + Kd*deriv;
+  lastErr = err;
+
+  int leftSpeed  = baseSpeed - (int)corr;
+  int rightSpeed = baseSpeed + (int)corr;
+
+  driveMotors(leftSpeed, rightSpeed);
+}
+
+// -------------------- Arduino Setup & Loop --------------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(trigf, OUTPUT); pinMode(echof, INPUT);
+  pinMode(trigl, OUTPUT); pinMode(echol, INPUT);
+  pinMode(trigr, OUTPUT); pinMode(echor, INPUT);
+
+  pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+  pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
+
+  // Setup PCINT Encoders
+  pinMode(LEFT_A, INPUT_PULLUP);  pinMode(LEFT_B, INPUT_PULLUP);
+  pinMode(RIGHT_A, INPUT_PULLUP); pinMode(RIGHT_B, INPUT_PULLUP);
+
+  PCICR |= (1 << PCIE1);
+  PCMSK1 |= (1 << PCINT8) | (1 << PCINT9) | (1 << PCINT10) | (1 << PCINT11);
+  lastPortC = PINC;
+
+  Wire.begin();
+  initMPU();
+  calibrateGyroZ(500); // KEEP STILL
+  
+  resetPID();
+}
+
+void loop() {
+  // Update the GLOBAL variables so PID_step() can actually see them!
+  leftDist  = getDistanceSafe(trigl, echol); delay(15);
+  rightDist = getDistanceSafe(trigr, echor); delay(15);
+  frontDist = getDistanceSafe(trigf, echof); delay(15);
+
+  // 1. LEFT OPEN
+  if (leftDist > sideOpenThresh) {
+    driveTicksStraight(TICKS_HALF_CELL); // Move to center
+    stopMotors(); delay(50);             // Brief mechanical settle, no revving
+    
+    turnByAngle(90.0); // NOTE: In my last code this was -90 for Left. Ensure your signs match your physical bot!
+    stopMotors(); delay(50);
+    
+    // CRITICAL: Drive completely out of the cell + 100 ticks extra to clear the sensor blindspot
+    driveTicksStraight(TICKS_HALF_CELL + 100); 
+    
+    resetPID();
+    return;
+  }
+  
+  // 2. FRONT CLEAR (Straight Corridor)
+  else if (frontDist > stopFront) {
+    PID_step();
+  }
+  
+  // 3. RIGHT OPEN
+  else if (rightDist > sideOpenThresh) {
+    // driveTicksStraight(TICKS_HALF_CELL); 
+    stopMotors(); delay(50);
+    
+    turnByAngle(-90.0);
+    stopMotors(); delay(50);
+    
+    driveTicksStraight(TICKS_HALF_CELL + 100); 
+    
+    resetPID();
+    return;
+  }
+  
+  // 4. DEAD END
+  else {
+    stopMotors(); delay(50);
+    turnByAngle(180.0f);
+    stopMotors(); delay(50);
+    
+    // Get out of the dead end cell before checking sensors again
+    driveTicksStraight(TICKS_HALF_CELL + 100); 
+    resetPID();
+  }
+}
