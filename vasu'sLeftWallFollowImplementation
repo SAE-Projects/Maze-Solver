@@ -60,10 +60,14 @@ volatile long leftCount = 0;
 volatile long rightCount = 0;
 uint8_t lastPortC;
 
+// === IMU & Filter Variables ===
 float currentYaw = 0.0;
 unsigned long lastYawTime = 0;
 float gzBias = 0.0f;
 const float ANGLE_TOL = 3.0f; 
+
+float alpha = 0.15; // Recursive Low-Pass Filter constant (Tune: 0.1 to 0.3)
+float filteredRate = 0.0; // Stores the smoothed gyro rate
 
 // -------------------- PCINT Encoder ISR --------------------
 ISR(PCINT1_vect) {
@@ -132,8 +136,13 @@ void updateYaw() {
   unsigned long now = millis();
   float dt = (now - lastYawTime) / 1000.0f;
   lastYawTime = now;
+  
   if (dt > 0 && dt < 0.1) { 
-      currentYaw += readGyroZ() * dt;
+      float rawRate = readGyroZ();
+      // Apply the recursive low-pass filter
+      filteredRate = (alpha * rawRate) + ((1.0f - alpha) * filteredRate);
+      // Integrate the smooth rate to update the yaw
+      currentYaw += filteredRate * dt;
   }
 }
 
@@ -148,31 +157,6 @@ float getDistanceSafe(int trig, int echo) {
   if (duration == 0) return 1000; 
   return duration * 0.034 / 2; 
 }
-
-// void updateSensors() {
-//   unsigned long now = millis();
-  
-//   // If 15ms haven't passed yet, skip reading and let the bot keep driving!
-//   if (now - lastPingTime < PING_INTERVAL) {
-//     return; 
-//   }
-
-//   // It's time to read ONE sensor
-//   if (sensorTurn == 0) {
-//     leftDist = getDistance(trigl, echol);
-//     sensorTurn = 1; // Next time, read right
-//   } 
-//   else if (sensorTurn == 1) {
-//     rightDist = getDistance(trigr, echor);
-//     sensorTurn = 2; // Next time, read front
-//   } 
-//   else if (sensorTurn == 2) {
-//     frontDist = getDistance(trigf, echof);
-//     sensorTurn = 0; // Next time, back to left
-//   }
-
-//   lastPingTime = now; // Reset the timer
-// }
 
 // -------------------- Motion Primitives --------------------
 void stopMotors() {
@@ -218,6 +202,7 @@ void resetPID() {
   integ = 0;
   lastErr = 0;
   currentYaw = 0; 
+  filteredRate = 0.0; // Wipe filter memory
   lastYawTime = millis();
   lastPID = millis();
 }
@@ -229,6 +214,7 @@ void driveTicksStraight(long targetTicks) {
   interrupts();
   
   currentYaw = 0; 
+  filteredRate = 0.0; // Wipe filter memory
   lastYawTime = millis();
   
   while (true) {
@@ -248,6 +234,7 @@ void driveTicksStraight(long targetTicks) {
 
 void turnByAngle(float targetAngleDeg) {
   currentYaw = 0;
+  filteredRate = 0.0; // Wipe filter memory
   lastYawTime = millis();
 
   // -90 is Left, +90 is Right
@@ -275,32 +262,9 @@ void turnByAngle(float targetAngleDeg) {
   }
   stopMotors();
 }
-void driveUntilWallsDetected() {
-  currentYaw = 0; 
-  lastYawTime = millis();
-  
-  while (true) {
-    // Keep polling the sensors in the background without delays
-    // updateSensors(); 
-    
-    // Break if both walls return, or if front wall approaches
-    // Notice we use the globals now!
-    if ((leftDist < corridorThresh && rightDist < corridorThresh) || frontDist < stopFront) {
-      break;
-    }
-
-    updateYaw();
-    float correction = currentYaw * 2.0; 
-    driveMotors(baseSpeed + (int)correction, baseSpeed - (int)correction);
-  }
-  resetPID(); 
-}
 
 // -------------------- Standard PID --------------------
 void PID_step() {
-  // NO delays or getDistance calls here anymore!
-  // We just trust the leftDist and rightDist globals.
-  
   updateYaw(); 
   
   float err = 0;
@@ -376,7 +340,7 @@ void loop() {
     driveTicksStraight(TICKS_HALF_CELL); // Move to center
     stopMotors(); delay(50);             // Brief mechanical settle, no revving
     
-    turnByAngle(90.0); // NOTE: In my last code this was -90 for Left. Ensure your signs match your physical bot!
+    turnByAngle(90.0); // NOTE: Ensure your signs match your physical bot!
     stopMotors(); delay(50);
     
     // CRITICAL: Drive completely out of the cell + 100 ticks extra to clear the sensor blindspot
